@@ -26,7 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import cv2
 import requests
@@ -58,7 +58,7 @@ object_label は対象の具体的な名称（例: 自転車、コーン）、po
 人物は pedestrian、自転車は bicycle、バイク・原付は motorcycle、自動車・トラック等は vehicle としてください。
 停車車両、ごみ収集車、電柱などの細い障害物も記録してください。年齢不明なら歩行者と記録してください。
 category は traffic/security。observed_behavior は none/approaching_vehicle/lingering/touching_vehicle/peering/object_moved/collision。
-接近・滞留・接触・のぞき込みは客観的な行動のみ security とし、交通上の接触事故は traffic/collision としてください。
+人物が自車に接近・滞留・接触・のぞき込みをした観測は security とし、交通上の接触事故は traffic/collision としてください。
 change_type は none/appeared/state_changed/object_moved/collision、blocks_path は映像で道路閉塞を確認した時のみ true。
 appeared は同じ場所が以前は空いており、対象が新たに現れたことを確認した場合のみです。不明なら none。
 observation_certainty は observed/uncertain。疑わしい対象は uncertain。犯罪意図、地域・天候、死角は推測しないでください。
@@ -69,21 +69,34 @@ temporal_status は最終観測時点の approaching/passing/departed/stationary
 latest_visible は今回の最後の画像で対象を確認できる場合だけ true にします。
 evidence_frames は実際に対象を確認した画像の秒数。first_seen/last_seen はその範囲です。
 notifications は空配列にしてください。通知選択と文章生成はPython側で実施します。
-notification_reason は near_movement/blocked_path/boarding_or_stop/contact/peering/change/none。
+notification_reason は互換用の観測関係コードで、通知の採否や重要度は判断しません。
+映像の根拠がある near_movement/blocked_path/boarding_or_stop/contact/peering/change/none を記録し、通常の存在は none とします。
 根拠のない影響を補わず、position は映像で確認した位置、evidence は観測事実のみです。
 単一画像だけでは接近・通過・停止の継続は判定せず unknown。画像間隔が大きい場合も unknown。
 JSONは最後まで閉じ、観測件数を制限しないでください。
 JSONのみを出力してください。例:
 {"latest_frame_sec":18.0,"observations":[{"event_id":"event_001","object_type":"bicycle",
-"direction":"後方","action":"passing","temporal_status":"departed","first_seen":12.0,
-"last_seen":15.0,"evidence_frames":[12.0,15.0],"latest_visible":false,
-"position":"","evidence":"後方を通過し離脱","notification_reason":"none","confirmation_action":""}],
+"object_label":"自転車","direction":"後方","action":"passing","temporal_status":"passing",
+"first_seen":17.9,"last_seen":18.0,"evidence_frames":[17.9,18.0],"latest_visible":true,
+"position":"道路中央","evidence":"後方の道路を自転車が通過中","category":"traffic",
+"observed_behavior":"none","change_type":"none","blocks_path":false,
+"observation_certainty":"observed","notification_reason":"none"}],
 "notifications":[]}
 """
 
 DUAL_VIDEO_USER_PROMPT_CONTEXT = """同時刻の前後映像を古い順に提示します。
 左が前方、右が後方です。観測は制限なく保存し、最終画像での状態と過去の行動を区別してください。
 不明瞭な動きや同一性は unknown。指定JSONのみを返してください。"""
+
+CHUNK_OBSERVATION_PROMPT = """前後チャンクと重複する画像を含みます。
+このチャンクの画像で確認できる対象・位置・行動・変化を、件数制限なく観測JSONに記録してください。
+別チャンクの対象との同一性は推測しないでください。統合と通知選択はPython側で行います。"""
+
+OBSERVATION_REPAIR_INSTRUCTIONS = """全観測を保持して完全なJSONを再生成してください。
+object_type は pedestrian/bicycle/motorcycle/vehicle/other/unknown。
+car は vehicle、person は pedestrian に正規化してください。
+notifications は空配列にし、通知文や確認行動文は生成しないでください。
+時刻は提示された画像だけを根拠にし、不明な状態は unknown としてください。"""
 
 ALLOWED_DIRECTIONS = {"前方", "左後方", "右後方", "後方", "補足情報"}
 IMAGE_SPECULATION_TERMS = ("可能性", "予想", "かもしれない", "恐れ", "おそれ")
@@ -106,7 +119,7 @@ DEFAULT_API_READ_TIMEOUT = 300.0
 DEFAULT_API_MAX_RETRIES = 3
 DEFAULT_CHUNK_FRAMES = 6
 DEFAULT_CHUNK_OVERLAP = 2
-SCENE_ID_PROFILE = "video_scene_describer5:observation-events-v1"
+SCENE_ID_PROFILE = "video_scene_describer5:observation-events-v2-prompt-cleanup"
 FALLBACK_STEPS = (
     {"name": "normal", "max_side_scale": 1.0, "quality_delta": 0, "max_tokens_scale": 1.0, "frame_step": 1},
     {"name": "reduced_image", "max_side_scale": 0.85, "quality_delta": -8, "max_tokens_scale": 1.0, "frame_step": 1},
@@ -435,8 +448,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--notification-style", choices=NOTIFICATION_STYLES, default="action_oriented")
     parser.add_argument("--notification-config", type=Path, default=DEFAULT_CONFIG_PATH,
                         help="鮮度、件数、優先順位の設定JSON")
-    parser.add_argument("--front-video", type=Path, required=True, help="分析するフロントカメラ動画ファイル")
-    parser.add_argument("--back-video", type=Path, required=True, help="分析するバックカメラ動画ファイル")
+    parser.add_argument("--render-report", type=Path,
+                        help="保存済みfinal_report.jsonの通知対象を固定して表示形式だけ変更する（VLM不要）")
+    parser.add_argument("--front-video", type=Path, help="分析するフロントカメラ動画ファイル")
+    parser.add_argument("--back-video", type=Path, help="分析するバックカメラ動画ファイル")
     parser.add_argument(
         "--location-info",
         default="",
@@ -473,7 +488,7 @@ def parse_args() -> argparse.Namespace:
         "--vlm-prompt-mode",
         choices=("caution", "detailed"),
         default=DEFAULT_VLM_PROMPT_MODE,
-        help="互換用。video_scene_describer3.py は停車時注意点JSON出力の専用プロンプトを使う",
+        help="互換用。5版はどちらの指定でも同じ観測JSONプロンプトを使う",
     )
     parser.add_argument("--max-side", type=int, default=DEFAULT_DUAL_VIDEO_MAX_SIDE, help="VLM推論用結合画像の最大辺")
     parser.add_argument("--quality", type=int, default=DEFAULT_JPEG_QUALITY, help="JPEG品質")
@@ -519,7 +534,7 @@ def parse_args() -> argparse.Namespace:
         "--chunk-merge-mode",
         choices=("local", "vlm"),
         default="local",
-        help="チャンク結果の統合方法。local=追加推論なしで重複排除、vlm=従来通りVLMで統合",
+        help="チャンク統合。5版は追加推論なしで統合する。vlmは互換用の別名",
     )
     parser.add_argument("--no-resume", action="store_true", help="中間結果による完了済みシーンのスキップを無効化")
     parser.add_argument(
@@ -547,7 +562,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-index-html", action="store_true", help="互換用の index.html 更新を行わない")
     parser.add_argument("--history", type=int, default=50, help="今回の起動中にHTMLへ残す件数")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.render_report is not None:
+        if args.front_video is not None or args.back_video is not None:
+            parser.error("--render-report と動画入力は同時指定できません")
+    elif args.front_video is None or args.back_video is None:
+        parser.error("動画解析には --front-video と --back-video が必要です")
+    return args
 
 
 def normalize_args(args: argparse.Namespace) -> None:
@@ -734,6 +755,9 @@ def build_timed_image_content(images: list[str], image_format: str,
 
 def validate_observations(data: dict[str, Any]) -> dict[str, Any]:
     import math
+
+    if not isinstance(data, dict):
+        raise ValueError("観測JSONのルートはオブジェクトである必要があります")
 
     def second(value: Any) -> bool:
         return value is None or (type(value) in (int, float) and math.isfinite(value) and value >= 0)
@@ -1031,16 +1055,18 @@ def select_notifications(events: list[dict[str, Any]], config: dict[str, Any]) -
     for candidate in ranked:
         event = event_map[candidate["event_id"]]
         # Deduplicate equivalent driver messages without asserting object identity.
-        signature = notification_variants(event, event["current"])["situation"]
-        if signature in signatures:
-            candidate.update(exclusion_reason="duplicate_message", duplicate_of=signatures[signature])
+        variants = notification_variants(event, event["current"])
+        keys = [(style, text) for style, text in variants.items()]
+        duplicate = next((signatures[key] for key in keys if key in signatures), None)
+        if duplicate is not None:
+            candidate.update(exclusion_reason="duplicate_message", duplicate_of=duplicate)
             continue
         limit = config["max_notifications"]
         if len(selected) >= limit or (len(selected) >= config["preferred_notifications"] and
                                       candidate["score"] < config["third_notification_min_score"]):
             candidate["exclusion_reason"] = "notification_limit"
             continue
-        signatures[signature] = event["event_id"]
+        signatures.update({key: event["event_id"] for key in keys})
         candidate["selected"] = True
         candidate["rank"] = len(selected) + 1
         selected.append(event)
@@ -1159,33 +1185,34 @@ def append_jsonl(path: Path, data: dict[str, Any]) -> None:
             f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 
-def load_completed_scene_results(path: Path) -> dict[str, dict[str, Any]]:
-    completed: dict[str, dict[str, Any]] = {}
+def iter_jsonl_objects(path: Path) -> Iterator[dict[str, Any]]:
+    """Read recoverable log records, ignoring partial lines and non-object JSON."""
     if not path.exists():
-        return completed
+        return
     with path.open("r", encoding="utf-8") as f:
         for line in f:
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if data.get("type") == "scene_complete" and data.get("scene_id") and data.get("description"):
-                completed[str(data["scene_id"])] = data
+            if isinstance(data, dict):
+                yield data
+
+
+def load_completed_scene_results(path: Path) -> dict[str, dict[str, Any]]:
+    completed: dict[str, dict[str, Any]] = {}
+    for data in iter_jsonl_objects(path):
+        if (data.get("type") == "scene_complete" and data.get("scene_id")
+                and isinstance(data.get("description"), str) and data["description"]):
+            completed[str(data["scene_id"])] = data
     return completed
 
 
 def load_completed_chunk_results(path: Path) -> dict[tuple[str, str], dict[str, Any]]:
     completed: dict[tuple[str, str], dict[str, Any]] = {}
-    if not path.exists():
-        return completed
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if data.get("type") == "chunk_complete" and data.get("scene_id") and data.get("chunk_id"):
-                completed[(str(data["scene_id"]), str(data["chunk_id"]))] = data
+    for data in iter_jsonl_objects(path):
+        if data.get("type") == "chunk_complete" and data.get("scene_id") and data.get("chunk_id"):
+            completed[(str(data["scene_id"]), str(data["chunk_id"]))] = data
     return completed
 
 
@@ -1201,6 +1228,8 @@ def analysis_profile(args: argparse.Namespace, max_side: int, quality: int) -> s
         "profile": SCENE_ID_PROFILE,
         "system_prompt": DUAL_VIDEO_SYSTEM_PROMPT_CONTEXT,
         "user_prompt": DUAL_VIDEO_USER_PROMPT_CONTEXT,
+        "chunk_prompt": CHUNK_OBSERVATION_PROMPT,
+        "repair_prompt": OBSERVATION_REPAIR_INSTRUCTIONS,
         "sample_fps": args.sample_fps,
         "temporal_frames": args.temporal_frames,
         "frame_interval": args.frame_interval,
@@ -1368,7 +1397,7 @@ def is_security_observation(message: str) -> bool:
 
 
 def local_risk_priority(direction: str, message: str) -> tuple[int, int, int]:
-    """Rank risks using the same explicit priority policy as the VLM prompt."""
+    """Rank legacy text-log entries for compatibility; structured events use select_notifications."""
     if direction == "補足情報":
         return (7, 0, 0)
     object_rank = {"pedestrian": 0, "bicycle": 1, "vehicle": 2, "other": 3}[risk_object_type(message)]
@@ -1483,8 +1512,7 @@ def analyze_dual_video_chunk(
     context_prompt = (
         f"これは scene_id={scene_id or '-'} のチャンク {chunk_index}/{chunk_count} です。"
         f"対象フレームはシーン内の {start + 1}〜{end} 枚目です。"
-        "前後チャンクと重複するフレームがあるため、同じ危険を重複して増やさず、"
-        "このチャンクで画像から確認できる注意点だけをJSONで出力してください。"
+        f"\n{CHUNK_OBSERVATION_PROMPT}"
     )
     chunk_messages = [
         {"role": "system", "content": system_prompt},
@@ -1643,7 +1671,7 @@ def describe_dual_video_scene(
     frame_times: list[float] | None = None,
     frame_timeline: list[dict[str, Any]] | None = None,
 ) -> str:
-    _ = prompt_mode  # Kept for CLI compatibility; this path must use JSON-only prompts.
+    _ = prompt_mode, chunk_merge_mode  # Compatibility options; observation JSON always merges locally.
     system_prompt = (
         f"{DUAL_VIDEO_SYSTEM_PROMPT_CONTEXT}\n"
         f"- 今回の結合画像では、左側の FRONT VIEW ONLY 領域は画像幅の約{front_percent}%です。"
@@ -1803,165 +1831,42 @@ def describe_dual_video_scene(
                 raise ApiRequestFailed(
                     f"すべてのチャンク解析に失敗しました: {len(failed_chunks)}/{len(ranges)}"
                 )
-        chunk_descriptions = []
-        for result in ordered_chunk_results:
-            suffix = f"（解析失敗: {result.error}）" if result.error else ""
-            chunk_descriptions.append(f"チャンク{result.chunk_index}: {result.description}{suffix}")
         log(
             "[chunks:parallel_end] "
             f"video={video_label or '-'} scene_id={scene_id or '-'} chunks={len(ranges)} "
             f"submitted={submitted_total} resumed={len([r for r in ordered_chunk_results if r.skipped])} "
             f"failed={len(failed_chunks)} fallback=chunk-level"
         )
-        if chunk_merge_mode == "local" or any(r.description.lstrip().startswith("{") for r in ordered_chunk_results):
-            merge_started = time.perf_counter()
-            merged_description = merge_chunk_descriptions_locally(ordered_chunk_results)
-            elapsed = time.perf_counter() - merge_started
-            if timing is not None:
-                timing["merge_elapsed_sec"] = elapsed
-                timing["merge_status"] = "executed"
-                timing["merge_reason"] = "local_merge"
-            if intermediate_path is not None:
-                append_jsonl(
-                    intermediate_path,
-                    {
-                        "type": "merge_complete",
-                        "scene_id": scene_id,
-                        "video": video_label,
-                        "chunk_count": len(ranges),
-                        "failed_chunk_count": len(failed_chunks),
-                        "fallback": "local",
-                        "elapsed_sec": elapsed,
-                        "merge_status": "executed",
-                        "merge_reason": "local_merge",
-                        "payload_bytes": 0,
-                        "finished_at": utc_now_iso(),
-                    },
-                )
-            log(
-                "[merge:end] "
-                f"video={video_label or '-'} scene_id={scene_id or '-'} elapsed_sec={elapsed:.2f} "
-                "status=success fallback=local"
-            )
-            return merged_description
-
-        merge_prompt = (
-            "次のチャンク別注意点を統合し、動画シーン全体として重要度の高い停車時の注意点を最大3項目にまとめてください。\n"
-            "重複は統合し、画像に明確に写っていない危険を追加しないでください。\n"
-            "人物の存在や視線だけで防犯通知を生成しないでください。別チャンクの人物を根拠なく同一人物と結びつけないでください。\n"
-            "解析失敗のチャンクは、失敗した事実だけを踏まえ、未確認の危険を推測で追加しないでください。\n"
-            "direction と message を持つ指定JSON形式だけで出力してください。\n\n"
-            + "\n".join(chunk_descriptions)
-        )
-        merge_messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": [{"type": "text", "text": merge_prompt}]},
-        ]
-        merge_payload_size = estimate_payload_size_bytes(
-            {"messages": merge_messages, "max_tokens": max_tokens, "temperature": temperature, "stream": False}
-        )
         merge_started = time.perf_counter()
-        log("[progress] merging chunk results", level="normal")
+        merged_description = merge_chunk_descriptions_locally(ordered_chunk_results)
+        elapsed = time.perf_counter() - merge_started
+        if timing is not None:
+            timing["merge_elapsed_sec"] = elapsed
+            timing["merge_status"] = "executed"
+            timing["merge_reason"] = "local_merge"
         if intermediate_path is not None:
             append_jsonl(
                 intermediate_path,
                 {
-                    "type": "merge_start",
+                    "type": "merge_complete",
                     "scene_id": scene_id,
                     "video": video_label,
                     "chunk_count": len(ranges),
                     "failed_chunk_count": len(failed_chunks),
-                    "fallback": "chunk-level",
-                    "payload_bytes": merge_payload_size,
-                    "started_at": utc_now_iso(),
+                    "fallback": "local",
+                    "elapsed_sec": elapsed,
+                    "merge_status": "executed",
+                    "merge_reason": "local_merge",
+                    "payload_bytes": 0,
+                    "finished_at": utc_now_iso(),
                 },
             )
         log(
-            "[merge:start] "
-            f"video={video_label or '-'} scene_id={scene_id or '-'} chunks={len(ranges)} "
-            f"failed_chunks={len(failed_chunks)} payload_bytes={merge_payload_size} fallback=chunk-level"
+            "[merge:end] "
+            f"video={video_label or '-'} scene_id={scene_id or '-'} elapsed_sec={elapsed:.2f} "
+            "status=success fallback=local"
         )
-        try:
-            api_result = request_dual_video_json(
-                base_url,
-                merge_messages,
-                session,
-                max_tokens,
-                temperature,
-                timeout,
-                retry_on_length,
-                max_retries=api_max_retries,
-                scene_id=scene_id,
-                chunk_id="merge",
-                video_label=video_label,
-                request_context=f"{request_context}:merge",
-                fallback_name_value="chunk-level",
-            )
-            merged_description = format_description_with_raw_context(api_result.content)
-            elapsed = time.perf_counter() - merge_started
-            if timing is not None:
-                timing["merge_elapsed_sec"] = elapsed
-                timing["merge_status"] = "executed"
-                timing["merge_reason"] = "api_called" if api_result.retry_count == 0 else "api_retry"
-            if intermediate_path is not None:
-                append_jsonl(
-                    intermediate_path,
-                    {
-                        "type": "merge_complete",
-                        "scene_id": scene_id,
-                        "video": video_label,
-                        "chunk_count": len(ranges),
-                        "failed_chunk_count": len(failed_chunks),
-                        "fallback": "chunk-level",
-                        "elapsed_sec": elapsed,
-                        "merge_status": "executed",
-                        "merge_reason": "api_called" if api_result.retry_count == 0 else "api_retry",
-                        "payload_bytes": merge_payload_size,
-                        "prompt_tokens": api_result.prompt_tokens,
-                        "completion_tokens": api_result.completion_tokens,
-                        "total_tokens": api_result.total_tokens,
-                        "finish_reason": api_result.finish_reason,
-                        "retry_count": api_result.retry_count,
-                        "finished_at": utc_now_iso(),
-                    },
-                )
-            log(
-                "[merge:end] "
-                f"video={video_label or '-'} scene_id={scene_id or '-'} elapsed_sec={elapsed:.2f} "
-                f"status=success fallback=chunk-level"
-            )
-            return merged_description
-        except Exception as exc:
-            elapsed = time.perf_counter() - merge_started
-            if timing is not None:
-                timing["merge_elapsed_sec"] = elapsed
-                timing["merge_status"] = "failed"
-                timing["merge_reason"] = "api_failed"
-            error = f"{type(exc).__name__}: {exc}"
-            if intermediate_path is not None:
-                append_jsonl(
-                    intermediate_path,
-                    {
-                        "type": "merge_failed",
-                        "scene_id": scene_id,
-                        "video": video_label,
-                        "chunk_count": len(ranges),
-                        "failed_chunk_count": len(failed_chunks),
-                        "fallback": "chunk-level",
-                        "elapsed_sec": elapsed,
-                        "merge_status": "failed",
-                        "merge_reason": "api_failed",
-                        "payload_bytes": merge_payload_size,
-                        "error": error,
-                        "finished_at": utc_now_iso(),
-                    },
-                )
-            log(
-                "[merge:end] "
-                f"video={video_label or '-'} scene_id={scene_id or '-'} elapsed_sec={elapsed:.2f} "
-                f"status=failed fallback=chunk-level error={error}"
-            )
-            raise
+        return merged_description
 
     image_content = build_timed_image_content(image_b64 or [], image_format,
         times)
@@ -1997,10 +1902,7 @@ def request_observation_json(
             # Give the model the actual failed answer, plus concrete schema guidance.
             retry_messages = [*messages, {"role": "assistant", "content": result.content},
                 {"role": "user", "content":
-                 f"検証エラー: {str(exc).split('; raw=')[0]}。全観測を保持して完全なJSONを再生成してください。"
-                 "object_type は pedestrian/bicycle/motorcycle/vehicle/other/unknown。car は vehicle、motorcycle は motorcycle、"
-                 "person は pedestrian。notifications は event_id 参照のみです。"
-                 "時刻は提示された画像だけを根拠にし、不明な状態は unknown としてください。"}]
+                 f"検証エラー: {str(exc).split('; raw=')[0]}。\n{OBSERVATION_REPAIR_INSTRUCTIONS}"}]
             budget = max(budget, result.completion_tokens or 0) * 2
     raise AssertionError("unreachable")
 
@@ -2127,9 +2029,10 @@ def request_dual_video_json(
     return ApiJsonResult(content=content, retry_count=total_retry_count, payload_bytes=last_payload_size)
 
 
-ENVIRONMENT_COMPARISON_PROMPT = """停車車両に戻ったドライバーのため、2枚の結合画像を比較してください。
+ENVIRONMENT_COMPARISON_PROMPT = """2枚の結合画像から、静止対象の位置と存在の変化を観測してください。
 1枚目は観測開始時、2枚目は最新の観測時です。各画像の左は前方、右は後方です。
 映像で明確に発進・後退経路を妨げる、または停車継続・乗降に直接影響する静止障害物だけを確認します。
+対象の観測事実を記録し、危険度・通知の採否・確認行動は生成しないでください。
 前方は上半分の切り出しです。映らない側方、ドア範囲、直近路面、正確な距離を推測しないでください。
 道路脇に見えるだけの遠い物体、通過中の人物や車両は障害物に含めません。
 最新画像でも残っている障害物を、開始時から存在する物も含めて挙げてください。
@@ -2137,13 +2040,32 @@ ENVIRONMENT_COMPARISON_PROMPT = """停車車両に戻ったドライバーのた
 遮蔽、画角の違い、低解像度の場合は initial_state を unknown にしてください。
 latest_visible は最新画像で障害物が明瞭に見える場合だけ true にします。
 blocks_path は道路をふさいでいることを最新画像で確認できる時だけ true、その他は false です。
+object_type は pedestrian/bicycle/motorcycle/vehicle/other/unknown。人物や車両を other にまとめないでください。
 position は映像内で区別できる位置を簡潔に記録してください。不明なら空文字です。
-障害物が消えた場合は出力しないでください。ドライバーが実際に忘れたとは断定しないでください。
+障害物が消えた場合は出力しないでください。
 出力はJSONのみ:
-{"obstacles":[{"direction":"後方","object":"コーン","initial_state":"absent",
+{"obstacles":[{"direction":"後方","object":"コーン","object_type":"other","initial_state":"absent",
 "latest_visible":true,"blocks_path":false,"position":"中央","evidence":"開始時は空いていた車両直近に最新画像ではコーンがある"}]}
 initial_state は present / absent / unknown のみ。確認できない場合は {"obstacles":[]}。
 """
+
+
+def environment_object_type(item: dict[str, Any]) -> str:
+    """Keep explicit canonical types; normalize older named-object comparison results."""
+    if "object_type" in item:
+        if item["object_type"] not in ("pedestrian", "bicycle", "motorcycle", "vehicle", "other", "unknown"):
+            raise ValueError("障害物の object_type が不正です")
+        return item["object_type"]
+    label = re.sub(r"[\s（）()]", "", item["object"])
+    for kind, pattern in (
+        ("pedestrian", r"(?:歩行者|人物|子ども|児童|人)$"),
+        ("motorcycle", r"(?:バイク|オートバイ|原付|原動機付自転車)$"),
+        ("bicycle", r"自転車$"),
+        ("vehicle", r"(?:車両|自動車|乗用車|停車車両|収集車|SUV|タクシー|トラック|バス|バン|車)$"),
+    ):
+        if re.search(pattern, label, re.IGNORECASE):
+            return kind
+    return "other"
 
 
 def compare_environment(args: argparse.Namespace, session: requests.Session,
@@ -2186,6 +2108,8 @@ def compare_environment(args: argparse.Namespace, session: requests.Session,
         args.temperature, api_timeout(args.connect_timeout, args.read_timeout),
         args.retry_on_length, max_retries=args.api_max_retries, request_context="environment_comparison")
     data = json.loads(extract_json_object(result.content))
+    if not isinstance(data, dict):
+        raise ValueError("障害物比較JSONのルートはオブジェクトである必要があります")
     obstacles = data.get("obstacles")
     if not isinstance(obstacles, list):
         raise ValueError("obstacles が配列ではありません")
@@ -2199,6 +2123,7 @@ def compare_environment(args: argparse.Namespace, session: requests.Session,
             raise ValueError("latest_visible が真偽値ではありません")
         if not all(isinstance(item.get(k), str) and item[k].strip() for k in ("object", "evidence")):
             raise ValueError("障害物の根拠または対象が空です")
+        item["object_type"] = environment_object_type(item)
         item.setdefault("position", "")
         item.setdefault("blocks_path", False)
         if type(item["blocks_path"]) is not bool:
@@ -2315,8 +2240,7 @@ def build_final_report(entries: list[DualVideoSceneEntry], *, interrupted: bool 
         if item.get("latest_visible") is not True:
             continue
         sec = environment.get("latest_sec")
-        object_type = {"停車車両": "vehicle", "車両": "vehicle", "ごみ収集車": "vehicle",
-                       "自転車": "bicycle", "バイク": "motorcycle"}.get(item["object"], "other")
+        object_type = environment_object_type(item)
         observations.append(dict(event_id=f"environment_{index}", object_type=object_type,
             object_label=item["object"], direction=item["direction"], action="stationary",
             temporal_status="stationary", first_seen=sec, last_seen=sec,
@@ -2357,11 +2281,17 @@ def write_final_report(output_dir: Path, entries: list[DualVideoSceneEntry], *, 
                        context_provider: ContextProvider | None = None) -> str:
     report = build_final_report(entries, interrupted=interrupted, environment=environment,
                                 notification_style=notification_style, config=config, context_provider=context_provider)
+    return write_report_files(output_dir, report)
+
+
+def write_report_files(output_dir: Path, report: dict[str, Any]) -> str:
+    """Write an already-selected report without changing observation or selection data."""
+    output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "observations.json").write_text(json.dumps(report["observations"], ensure_ascii=False, indent=2), encoding="utf-8")
     (output_dir / "final_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     lines = [f"車両に戻った際のフィードバック（最大{report['metadata']['max_notifications']}件）",
              f"解析済み: {report['analyzed_scene_count']}シーン / 失敗・未完了: {report['failed_scene_count']}シーン"]
-    if interrupted:
+    if report["interrupted"]:
         lines.append("中断までの暫定結果です。")
     if report["latest_frame_analysis_status"] != "completed":
         lines.append("最新の通行状況は確認できていません。")
@@ -2384,8 +2314,52 @@ def write_final_report(output_dir: Path, entries: list[DualVideoSceneEntry], *, 
     return description
 
 
+def render_saved_report(source: Path, output_dir: Path, notification_style: str) -> str:
+    """Switch saved variants only: no VLM request, tracking, ranking or re-selection."""
+    if notification_style not in NOTIFICATION_STYLES:
+        raise ValueError("通知表現が不正です")
+    if source.resolve() == (output_dir / "final_report.json").resolve():
+        raise ValueError("元のレポートを保持するため別の --output-dir を指定してください")
+    report = json.loads(source.read_text(encoding="utf-8"))
+    required = {"observations", "notifications", "metadata", "interrupted", "environment",
+                "analyzed_scene_count", "failed_scene_count", "latest_frame_analysis_status"}
+    if not isinstance(report, dict) or not required <= report.keys():
+        raise ValueError("保存済み最終レポートの形式が不正です")
+    notices = report["notifications"]
+    if (not isinstance(notices, list) or len(notices) > 3
+            or not isinstance(report["metadata"], dict)
+            or not isinstance(report["observations"], list)
+            or not isinstance(report["environment"], dict) or "status" not in report["environment"]):
+        raise ValueError("保存済み最終レポートの項目が不正です")
+    maximum = report["metadata"].get("max_notifications")
+    if type(maximum) is not int or not 0 <= maximum <= 3 or len(notices) > maximum:
+        raise ValueError("保存済みレポートの通知上限が不正です")
+    messages = []
+    for notice in notices:
+        if not isinstance(notice, dict) or not isinstance(notice.get("variants"), dict):
+            raise ValueError("保存済み通知に variants がありません")
+        message = notice["variants"].get(notification_style)
+        if not isinstance(message, str) or not message.strip():
+            raise ValueError(f"保存済み通知に {notification_style} の文章がありません")
+        if not {"rank", "direction", "event_id"} <= notice.keys():
+            raise ValueError("保存済み通知の項目が不足しています")
+        messages.append(message)
+    if len(messages) != len(set(messages)):
+        raise ValueError("保存済み通知の表示文が重複しています")
+    for notice, message in zip(notices, messages):
+        notice["message"] = message
+    report["risks"] = notices
+    report["notification_style"] = notification_style
+    report["metadata"]["notification_style"] = notification_style
+    return write_report_files(output_dir, report)
+
+
 def main() -> int:
     args = parse_args()
+    if args.render_report is not None:
+        description = render_saved_report(args.render_report, args.output_dir, args.notification_style)
+        print(description)
+        return 0
     normalize_args(args)
     notification_config = load_notification_config(args.notification_config)
     context_provider = SuppliedContextProvider([
