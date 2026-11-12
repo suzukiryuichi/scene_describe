@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "video_scene_describer5 canonical VLM observation response",
+  "description": "Canonical model output. Python also validates event references, time ranges, finite values and actually submitted evidence frames. Decoder-owned frame metadata is assigned after parsing.",
+  "type": "object",
+  "required": [
+    "observations"
+  ],
+  "properties": {
+    "latest_frame_sec": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "observations": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/observation"
+      }
+    },
+    "notifications": {
+      "type": "array",
+      "maxItems": 3,
+      "description": "Models are instructed to return []; legacy references are accepted but never used for selection.",
+      "items": {
+        "type": "object",
+        "required": [
+          "event_id"
+        ],
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "observation": {
+      "type": "object",
+      "required": [
+        "event_id",
+        "object_type",
+        "direction",
+        "action",
+        "temporal_status",
+        "evidence_frames"
+      ],
+      "properties": {
+        "action": {
+          "type": "string",
+          "minLength": 1
+        },
+        "position": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "confirmation_action": {
+          "type": "string"
+        },
+        "object_label": {
+          "type": "string"
+        },
+        "object_type": {
+          "enum": [
+            "pedestrian",
+            "bicycle",
+            "motorcycle",
+            "vehicle",
+            "other",
+            "unknown"
+          ]
+        },
+        "direction": {
+          "enum": [
+            "前方",
+            "後方"
+          ]
+        },
+        "temporal_status": {
+          "enum": [
+            "approaching",
+            "passing",
+            "departed",
+            "stationary",
+            "unknown"
+          ]
+        },
+        "category": {
+          "enum": [
+            "traffic",
+            "security"
+          ]
+        },
+        "observed_behavior": {
+          "enum": [
+            "none",
+            "approaching_vehicle",
+            "lingering",
+            "touching_vehicle",
+            "peering",
+            "object_moved",
+            "collision"
+          ]
+        },
+        "change_type": {
+          "enum": [
+            "none",
+            "appeared",
+            "state_changed",
+            "object_moved",
+            "collision"
+          ]
+        },
+        "observation_certainty": {
+          "enum": [
+            "observed",
+            "uncertain"
+          ]
+        },
+        "notification_reason": {
+          "enum": [
+            "near_movement",
+            "blocked_path",
+            "boarding_or_stop",
+            "contact",
+            "peering",
+            "change",
+            "none"
+          ]
+        },
+        "event_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "first_seen": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "last_seen": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "evidence_frames": {
+          "type": "array",
+          "items": {
+            "type": "number",
+            "minimum": 0
+          }
+        },
+        "latest_visible": {
+          "type": "boolean"
+        },
+        "blocks_path": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

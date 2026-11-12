@@ -1,0 +1,11 @@
+{
+  "preferred_notifications": 2,
+  "max_notifications": 3,
+  "third_notification_min_score": 8.0,
+  "minimum_score": 1.0,
+  "current_max_age_sec": {"pedestrian": 2.0, "bicycle": 2.0, "motorcycle": 2.0, "vehicle": 5.0, "other": 5.0, "unknown": 2.0},
+  "max_motion_gap_sec": 2.0,
+  "historical_max_age_sec": 60.0,
+  "notify_historical_changes": false,
+  "weights": {"departure_safety": 5.0, "rear_or_overlooked": 1.0, "vulnerable": 1.0, "freshness": 2.0, "important_change": 3.0, "hard_to_notice": 1.0}
+}
